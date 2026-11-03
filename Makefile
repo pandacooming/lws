@@ -250,7 +250,7 @@ test-e2e-gang-scheduling-volcano: kustomize manifests fmt vet envtest ginkgo kin
 	SCHEDULER_PROVIDER=volcano VOLCANO_VERSION=$(VOLCANO_VERSION) E2E_KIND_VERSION=$(E2E_KIND_VERSION) KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) GINKGO=$(GINKGO) USE_EXISTING_CLUSTER=$(USE_EXISTING_CLUSTER) IMAGE_TAG=$(IMG) ARTIFACTS=$(ARTIFACTS) ./hack/e2e-test.sh
 
 .PHONY: test-e2e-gang-scheduling-was
-test-e2e-gang-scheduling-was: kustomize manifests fmt vet ginkgo kind-image-build ## Run native Kubernetes workload-aware scheduling E2E tests
+test-e2e-gang-scheduling-was: kustomize manifests fmt vet ginkgo kind-image-build ## Run native Kubernetes workload-aware scheduling E2E tests (test/e2e/config/kind-was.yaml)
 	SCHEDULER_PROVIDER=kubernetes E2E_KIND_VERSION=$(E2E_KIND_VERSION) KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) GINKGO=$(GINKGO) USE_EXISTING_CLUSTER=$(USE_EXISTING_CLUSTER) IMAGE_TAG=$(IMG) ARTIFACTS=$(ARTIFACTS) ./hack/e2e-test.sh
 
 .PHONY: lint

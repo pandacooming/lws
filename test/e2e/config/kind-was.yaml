@@ -1,6 +1,28 @@
+# Kind cluster for native workload-aware scheduling e2e
+# (make test-e2e-gang-scheduling-was).
+# GenericWorkload serves the Workload and PodGroup APIs.
+# TopologyAwareWorkloadScheduling makes kube-scheduler enforce
+# schedulingConstraints.topology. The two workers are schedulable nodes in
+# different zones; kind taints the control plane when workers exist, and the
+# topology test treats whichever nodes are schedulable. Keep the label key and
+# values aligned with wasTopologyKey in test/e2e/e2e_was_scheduling_test.go.
+# The key must be one kubelet accepts in --node-labels. Kind passes node
+# labels that way, and rejects keys under kubernetes.io or k8s.io except
+# the allow-list, which includes topology.kubernetes.io/zone.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 featureGates:
   GenericWorkload: true
+  TopologyAwareWorkloadScheduling: true
 runtimeConfig:
   scheduling.k8s.io/v1beta1: true
+nodes:
+- role: control-plane
+  labels:
+    topology.kubernetes.io/zone: zone-a
+- role: worker
+  labels:
+    topology.kubernetes.io/zone: zone-a
+- role: worker
+  labels:
+    topology.kubernetes.io/zone: zone-b
