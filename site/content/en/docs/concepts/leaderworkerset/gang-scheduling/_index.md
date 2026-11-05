@@ -91,6 +91,23 @@ that is being deleted:
 
 In all cases, LWS sets `spec.schedulingGroup.podGroupName` on each pod so kube-scheduler can match member pods to the correct gang.
 
+## Topology constraints
+
+`schedulingConstraints.topology` places every pod of a PodGroup on nodes that share one value of a node label. The list holds one constraint. LWS copies it onto the PodGroup for the active scheduling level:
+
+```yaml
+spec:
+  scheduling:
+    replica:
+      schedulingConstraints:
+        topology:
+        - key: topology.kubernetes.io/zone
+```
+
+A replica-level constraint applies to that replica's leader and workers. The same field under `spec.scheduling` applies to the whole LeaderWorkerSet, and under `spec.scheduling.replica.leader` or `spec.scheduling.replica.worker` it applies to that role's PodGroup. Different PodGroups may land in different domains. A group that cannot fit entirely inside one domain stays pending until a domain has room for every member.
+
+The scheduler enforces the constraint only when the cluster enables the alpha `TopologyAwareWorkloadScheduling` feature gate on kube-apiserver and kube-scheduler, in addition to the [gang-scheduling prerequisites](../../../installation/#enable-native-gang-scheduling). Label the nodes with the constraint's key. LWS does not add a separate feature gate for the field.
+
 ## Compatibility and update restrictions
 
 Native scheduling is an alpha feature. See the [installation
@@ -107,9 +124,9 @@ The initial implementation has these important restrictions:
   leader is ready, so the complete gang could never form.
 - Do not set `spec.schedulingGroup` in the leader or worker pod template. LWS
   derives and sets revision-aware PodGroup names.
-- Gang scheduling cannot be combined with the
-  `leaderworkerset.sigs.k8s.io/exclusive-topology` annotation in this alpha
-  release.
+- Gang scheduling, and `schedulingConstraints.topology`, cannot be combined
+  with the `leaderworkerset.sigs.k8s.io/exclusive-topology` annotation in this
+  alpha release.
 - Leader and worker templates must use the same `priorityClassName`. That
   effective priority class cannot change after creation.
 - Phase 1 accepts exactly one active scheduling level among whole-LWS

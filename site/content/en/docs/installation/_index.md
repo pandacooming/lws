@@ -204,6 +204,8 @@ runtimeConfig:
   scheduling.k8s.io/v1beta1: true
 ```
 
+`schedulingConstraints.topology` needs the alpha `TopologyAwareWorkloadScheduling` feature gate on kube-apiserver and kube-scheduler as well. Add it beside `GenericWorkload`. Label nodes with the topology key the constraint names; a Kind node `labels` entry is enough. See [Topology constraints](../concepts/leaderworkerset/gang-scheduling/#topology-constraints).
+
 ### Configure LeaderWorkerSet
 
 Enable the LWS `WorkloadAwareScheduling` feature gate and select the native
