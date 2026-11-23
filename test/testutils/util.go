@@ -207,8 +207,11 @@ func makeLeaderPod(leaderSts appsv1.StatefulSet, lws *leaderworkerset.LeaderWork
 	if lws.Spec.NetworkConfig != nil && *lws.Spec.NetworkConfig.SubdomainPolicy == leaderworkerset.SubdomainUniquePerReplica {
 		pod.Spec.Subdomain = pod.Name
 	}
-	if lws.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey] != "" {
-		pod.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey] = lws.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]
+	if topologyKey, ok := utils.ExclusiveTopologyKey(lws); ok {
+		pod.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey] = topologyKey
+	}
+	if subGroupTopologyKey, ok := utils.SubGroupExclusiveTopologyKey(lws); ok {
+		pod.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] = subGroupTopologyKey
 	}
 	// Set the controller owner reference for garbage collection and reconciliation.
 	if err := ctrl.SetControllerReference(&leaderSts, pod, scheme.Scheme); err != nil {
@@ -621,8 +624,11 @@ func ValidatePodExclusivePlacementTerms(pod corev1.Pod, exclusiveAnnotationKey s
 	validAntiAffinity := false
 	for _, podAffinityTerm := range pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
 		if podAffinityTerm.TopologyKey == pod.Annotations[exclusiveAnnotationKey] {
+			if podAffinityTerm.LabelSelector == nil || len(podAffinityTerm.LabelSelector.MatchExpressions) == 0 {
+				continue
+			}
 			requirement := podAffinityTerm.LabelSelector.MatchExpressions[0]
-			if requirement.Key == uniqueHashLabelKey && requirement.Operator == metav1.LabelSelectorOpIn && requirement.Values[0] != "" {
+			if requirement.Key == uniqueHashLabelKey && requirement.Operator == metav1.LabelSelectorOpIn && len(requirement.Values) > 0 && requirement.Values[0] != "" {
 				validAffinity = true
 				termsCount++
 			}
@@ -630,6 +636,9 @@ func ValidatePodExclusivePlacementTerms(pod corev1.Pod, exclusiveAnnotationKey s
 	}
 	for _, podAntiAffinity := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
 		if podAntiAffinity.TopologyKey == pod.Annotations[exclusiveAnnotationKey] {
+			if podAntiAffinity.LabelSelector == nil {
+				continue
+			}
 			requirements := podAntiAffinity.LabelSelector.MatchExpressions
 			hasExist := false
 			hasNotIn := false
@@ -637,7 +646,7 @@ func ValidatePodExclusivePlacementTerms(pod corev1.Pod, exclusiveAnnotationKey s
 				if requirement.Key == uniqueHashLabelKey && requirement.Operator == metav1.LabelSelectorOpExists {
 					hasExist = true
 				}
-				if requirement.Key == uniqueHashLabelKey && requirement.Operator == metav1.LabelSelectorOpNotIn && requirement.Values[0] != "" {
+				if requirement.Key == uniqueHashLabelKey && requirement.Operator == metav1.LabelSelectorOpNotIn && len(requirement.Values) > 0 && requirement.Values[0] != "" {
 					hasNotIn = true
 				}
 			}

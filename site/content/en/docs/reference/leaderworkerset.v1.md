@@ -293,6 +293,18 @@ RollingUpdate strategy whose configuration takes its own defaults.</p>
    <p>networkConfig defines the network configuration of the group</p>
 </td>
 </tr>
+<tr><td><code>placementPolicy</code><br/>
+<a href="#leaderworkerset-x-k8s-io-v1-PlacementPolicy"><code>PlacementPolicy</code></a>
+</td>
+<td>
+   <p>placementPolicy defines the topology placement of each group and, in
+subGroup, of each subgroup. It replaces the
+leaderworkerset.sigs.k8s.io/exclusive-topology and
+leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology annotations, and
+setting a level in both with different values is rejected. Changing the
+effective placement creates a new revision.</p>
+</td>
+</tr>
 <tr><td><code>scheduling</code><br/>
 <a href="#leaderworkerset-x-k8s-io-v1-LeaderWorkerSetScheduling"><code>LeaderWorkerSetScheduling</code></a>
 </td>
@@ -597,6 +609,66 @@ the headless service, defaults to shared</p>
 </tbody>
 </table>
 
+## `PlacementPolicy`     {#leaderworkerset-x-k8s-io-v1-PlacementPolicy}
+    
+
+**Appears in:**
+
+- [LeaderWorkerSetSpec](#leaderworkerset-x-k8s-io-v1-LeaderWorkerSetSpec)
+
+
+<p>PlacementPolicy defines the topology placement of the pods in each group,
+and optionally in each subgroup.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>type</code><br/>
+<a href="#leaderworkerset-x-k8s-io-v1-PlacementType"><code>PlacementType</code></a>
+</td>
+<td>
+   <p>type selects the group level placement guarantee. Defaults to None.</p>
+</td>
+</tr>
+<tr><td><code>topology</code><br/>
+<code>string</code>
+</td>
+<td>
+   <p>topology is the node label key that defines the topology domain of a
+group, for example a rack, a block or a zone. Required when type is
+ExclusiveTopology.</p>
+</td>
+</tr>
+<tr><td><code>subGroup</code><br/>
+<a href="#leaderworkerset-x-k8s-io-v1-SubGroupPlacementPolicy"><code>SubGroupPlacementPolicy</code></a>
+</td>
+<td>
+   <p>subGroup defines the topology placement of each subgroup within a group.
+It requires leaderWorkerTemplate.subGroupPolicy.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## `PlacementType`     {#leaderworkerset-x-k8s-io-v1-PlacementType}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [PlacementPolicy](#leaderworkerset-x-k8s-io-v1-PlacementPolicy)
+
+- [SubGroupPlacementPolicy](#leaderworkerset-x-k8s-io-v1-SubGroupPlacementPolicy)
+
+
+<p>PlacementType defines the topology placement guarantee.</p>
+
+
+
+
 ## `PodTerminationPolicyType`     {#leaderworkerset-x-k8s-io-v1-PodTerminationPolicyType}
     
 (Alias of `string`)
@@ -694,7 +766,7 @@ The default value is 0.</p>
 </td>
 <td>
    <p>maxUnavailable is the maximum number of replicas that can be unavailable during the update.
-Value can be an absolute number (ex: 5) or a percentage of total replicas at the start of update (ex: 10%).
+Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
 Absolute number is calculated from percentage by rounding down.
 This can not be 0 if MaxSurge is 0.
 By default, a fixed value of 1 is used.
@@ -702,7 +774,17 @@ Example: when this is set to 30%, the old replicas can be scaled down by 30%
 immediately when the rolling update starts. Once new replicas are ready, old replicas
 can be scaled down further, followed by scaling up the new replicas, ensuring
 that at least 70% of original number of replicas are available at all times
-during the update.</p>
+during the update.
+During a combined template update and scale-up (or a scale-up during an active
+rollout), the controller paces disruption against
+max(0, min(baselineReplicas, spec.replicas) - maxUnavailable). Here
+baselineReplicas is the non-surge replica count from before the rollout. For
+this floor, a percentage maxUnavailable resolves against
+min(baselineReplicas, spec.replicas). Pending additions do not consume the
+disruption budget of existing groups, while Ready additions and surge groups
+grant replacement credit. A superseding template update raises
+baselineReplicas to the count of Ready groups (up to spec.replicas) to protect
+Ready additions.</p>
 </td>
 </tr>
 <tr><td><code>maxSurge</code> <B>[Required]</B><br/>
@@ -711,8 +793,7 @@ during the update.</p>
 <td>
    <p>maxSurge is the maximum number of replicas that can be scheduled above the original number of
 replicas.
-Value can be an absolute number (ex: 5) or a percentage of total replicas at
-the start of the update (ex: 10%).
+Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
 Absolute number is calculated from percentage by rounding up.
 By default, a value of 0 is used.
 Example: when this is set to 30%, the new replicas can be scaled up by 30%
@@ -784,6 +865,41 @@ maxSurge 0 and partition 0.</p>
 
 
 
+
+## `SubGroupPlacementPolicy`     {#leaderworkerset-x-k8s-io-v1-SubGroupPlacementPolicy}
+    
+
+**Appears in:**
+
+- [PlacementPolicy](#leaderworkerset-x-k8s-io-v1-PlacementPolicy)
+
+
+<p>SubGroupPlacementPolicy defines the topology placement of the pods in each
+subgroup.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>type</code><br/>
+<a href="#leaderworkerset-x-k8s-io-v1-PlacementType"><code>PlacementType</code></a>
+</td>
+<td>
+   <p>type selects the subgroup level placement guarantee. Defaults to None.</p>
+</td>
+</tr>
+<tr><td><code>topology</code><br/>
+<code>string</code>
+</td>
+<td>
+   <p>topology is the node label key that defines the topology domain of a
+subgroup. Required when type is ExclusiveTopology.</p>
+</td>
+</tr>
+</tbody>
+</table>
 
 ## `SubGroupPolicy`     {#leaderworkerset-x-k8s-io-v1-SubGroupPolicy}
     

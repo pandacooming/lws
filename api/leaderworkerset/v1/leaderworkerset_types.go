@@ -127,6 +127,18 @@ const (
 	// recreation has been triggered but deferred by restartBackoff.
 	GroupRecreatePendingAnnotationKey string = "leaderworkerset.sigs.k8s.io/group-recreate-pending"
 
+	// WorkerUIDsAnnotationKey is set on a leader Pod once every worker of its
+	// current revision exists. The value starts with that revision key, then
+	// the workers' Pod UIDs (or, for a very large group, a fixed-size hash of
+	// those UIDs plus the count). A later reconcile treats a missing worker or
+	// a worker UID that is not in this set as a failure of
+	// RecreateGroupOnPodRestart or RecreateGroupAfterStart, including the first
+	// reconcile after the controller process starts. The record is replaced
+	// when the leader's revision changes, because a rolling update keeps the
+	// leader pod and removes the previous revision's workers. Recreating the
+	// group replaces the leader, so the new group records its own workers.
+	WorkerUIDsAnnotationKey string = "leaderworkerset.sigs.k8s.io/worker-uids"
+
 	// GroupRestartBudgetExhaustedAnnotationKey is set on a leader Pod after its
 	// group exhausts maxGroupRestarts.
 	GroupRestartBudgetExhaustedAnnotationKey string = "leaderworkerset.sigs.k8s.io/group-restart-budget-exhausted"
@@ -236,6 +248,15 @@ type LeaderWorkerSetSpec struct {
 	// networkConfig defines the network configuration of the group
 	// +optional
 	NetworkConfig *NetworkConfig `json:"networkConfig,omitempty"`
+
+	// placementPolicy defines the topology placement of each group and, in
+	// subGroup, of each subgroup. It replaces the
+	// leaderworkerset.sigs.k8s.io/exclusive-topology and
+	// leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology annotations, and
+	// setting a level in both with different values is rejected. Changing the
+	// effective placement creates a new revision.
+	// +optional
+	PlacementPolicy *PlacementPolicy `json:"placementPolicy,omitempty"`
 
 	// scheduling defines Workload-Aware Scheduling for this LeaderWorkerSet.
 	// This field is immutable.
@@ -559,6 +580,59 @@ const (
 	SubGroupPolicyTypeLeaderExcluded SubGroupPolicyType = "LeaderExcluded"
 )
 
+// PlacementPolicy defines the topology placement of the pods in each group,
+// and optionally in each subgroup.
+// +kubebuilder:validation:XValidation:rule="self.type != 'ExclusiveTopology' || (has(self.topology) && size(self.topology) > 0)",message="topology is required when type is ExclusiveTopology"
+// +kubebuilder:validation:XValidation:rule="self.type == 'ExclusiveTopology' || !has(self.topology) || size(self.topology) == 0",message="topology must be empty when type is None"
+type PlacementPolicy struct {
+	// type selects the group level placement guarantee. Defaults to None.
+	// +kubebuilder:default=None
+	// +kubebuilder:validation:Enum={None,ExclusiveTopology}
+	// +optional
+	Type PlacementType `json:"type,omitempty"`
+
+	// topology is the node label key that defines the topology domain of a
+	// group, for example a rack, a block or a zone. Required when type is
+	// ExclusiveTopology.
+	// +optional
+	Topology string `json:"topology,omitempty"`
+
+	// subGroup defines the topology placement of each subgroup within a group.
+	// It requires leaderWorkerTemplate.subGroupPolicy.
+	// +optional
+	SubGroup *SubGroupPlacementPolicy `json:"subGroup,omitempty"`
+}
+
+// SubGroupPlacementPolicy defines the topology placement of the pods in each
+// subgroup.
+// +kubebuilder:validation:XValidation:rule="self.type != 'ExclusiveTopology' || (has(self.topology) && size(self.topology) > 0)",message="topology is required when type is ExclusiveTopology"
+// +kubebuilder:validation:XValidation:rule="self.type == 'ExclusiveTopology' || !has(self.topology) || size(self.topology) == 0",message="topology must be empty when type is None"
+type SubGroupPlacementPolicy struct {
+	// type selects the subgroup level placement guarantee. Defaults to None.
+	// +kubebuilder:default=None
+	// +kubebuilder:validation:Enum={None,ExclusiveTopology}
+	// +optional
+	Type PlacementType `json:"type,omitempty"`
+
+	// topology is the node label key that defines the topology domain of a
+	// subgroup. Required when type is ExclusiveTopology.
+	// +optional
+	Topology string `json:"topology,omitempty"`
+}
+
+// PlacementType defines the topology placement guarantee.
+type PlacementType string
+
+const (
+	// PlacementNone injects no placement affinity.
+	PlacementNone PlacementType = "None"
+
+	// PlacementExclusiveTopology places all pods of a group, or of a subgroup,
+	// in one topology domain and keeps the pods of other groups, or subgroups,
+	// out of that domain.
+	PlacementExclusiveTopology PlacementType = "ExclusiveTopology"
+)
+
 type NetworkConfig struct {
 	// subdomainPolicy determines the policy that will be used when creating
 	// the headless service, defaults to shared
@@ -605,7 +679,7 @@ type RollingUpdateConfiguration struct {
 	Partition *int32 `json:"partition,omitempty"`
 
 	// maxUnavailable is the maximum number of replicas that can be unavailable during the update.
-	// Value can be an absolute number (ex: 5) or a percentage of total replicas at the start of update (ex: 10%).
+	// Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
 	// Absolute number is calculated from percentage by rounding down.
 	// This can not be 0 if MaxSurge is 0.
 	// By default, a fixed value of 1 is used.
@@ -614,6 +688,16 @@ type RollingUpdateConfiguration struct {
 	// can be scaled down further, followed by scaling up the new replicas, ensuring
 	// that at least 70% of original number of replicas are available at all times
 	// during the update.
+	// During a combined template update and scale-up (or a scale-up during an active
+	// rollout), the controller paces disruption against
+	// max(0, min(baselineReplicas, spec.replicas) - maxUnavailable). Here
+	// baselineReplicas is the non-surge replica count from before the rollout. For
+	// this floor, a percentage maxUnavailable resolves against
+	// min(baselineReplicas, spec.replicas). Pending additions do not consume the
+	// disruption budget of existing groups, while Ready additions and surge groups
+	// grant replacement credit. A superseding template update raises
+	// baselineReplicas to the count of Ready groups (up to spec.replicas) to protect
+	// Ready additions.
 	//
 	// +kubebuilder:validation:XIntOrString
 	// +kubebuilder:default=1
@@ -621,8 +705,7 @@ type RollingUpdateConfiguration struct {
 
 	// maxSurge is the maximum number of replicas that can be scheduled above the original number of
 	// replicas.
-	// Value can be an absolute number (ex: 5) or a percentage of total replicas at
-	// the start of the update (ex: 10%).
+	// Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
 	// Absolute number is calculated from percentage by rounding up.
 	// By default, a value of 0 is used.
 	// Example: when this is set to 30%, the new replicas can be scaled up by 30%

@@ -17575,6 +17575,57 @@ spec:
                             required:
                               - subdomainPolicy
                             type: object
+                          placementPolicy:
+                            description: |-
+                              placementPolicy defines the topology placement of each group and, in
+                              subGroup, of each subgroup. It replaces the
+                              leaderworkerset.sigs.k8s.io/exclusive-topology and
+                              leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology annotations, and
+                              setting a level in both with different values is rejected. Changing the
+                              effective placement creates a new revision.
+                            properties:
+                              subGroup:
+                                description: |-
+                                  subGroup defines the topology placement of each subgroup within a group.
+                                  It requires leaderWorkerTemplate.subGroupPolicy.
+                                properties:
+                                  topology:
+                                    description: |-
+                                      topology is the node label key that defines the topology domain of a
+                                      subgroup. Required when type is ExclusiveTopology.
+                                    type: string
+                                  type:
+                                    default: None
+                                    description: type selects the subgroup level placement guarantee. Defaults to None.
+                                    enum:
+                                      - None
+                                      - ExclusiveTopology
+                                    type: string
+                                type: object
+                                x-kubernetes-validations:
+                                  - message: topology is required when type is ExclusiveTopology
+                                    rule: self.type != 'ExclusiveTopology' || (has(self.topology) && size(self.topology) > 0)
+                                  - message: topology must be empty when type is None
+                                    rule: self.type == 'ExclusiveTopology' || !has(self.topology) || size(self.topology) == 0
+                              topology:
+                                description: |-
+                                  topology is the node label key that defines the topology domain of a
+                                  group, for example a rack, a block or a zone. Required when type is
+                                  ExclusiveTopology.
+                                type: string
+                              type:
+                                default: None
+                                description: type selects the group level placement guarantee. Defaults to None.
+                                enum:
+                                  - None
+                                  - ExclusiveTopology
+                                type: string
+                            type: object
+                            x-kubernetes-validations:
+                              - message: topology is required when type is ExclusiveTopology
+                                rule: self.type != 'ExclusiveTopology' || (has(self.topology) && size(self.topology) > 0)
+                              - message: topology must be empty when type is None
+                                rule: self.type == 'ExclusiveTopology' || !has(self.topology) || size(self.topology) == 0
                           podTerminationPolicy:
                             default: Sequential
                             description: |-
@@ -17625,8 +17676,7 @@ spec:
                                     description: |-
                                       maxSurge is the maximum number of replicas that can be scheduled above the original number of
                                       replicas.
-                                      Value can be an absolute number (ex: 5) or a percentage of total replicas at
-                                      the start of the update (ex: 10%).
+                                      Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
                                       Absolute number is calculated from percentage by rounding up.
                                       By default, a value of 0 is used.
                                       Example: when this is set to 30%, the new replicas can be scaled up by 30%
@@ -17642,7 +17692,7 @@ spec:
                                     default: 1
                                     description: |-
                                       maxUnavailable is the maximum number of replicas that can be unavailable during the update.
-                                      Value can be an absolute number (ex: 5) or a percentage of total replicas at the start of update (ex: 10%).
+                                      Value can be an absolute number (ex: 5) or a percentage of desired spec.replicas (ex: 10%).
                                       Absolute number is calculated from percentage by rounding down.
                                       This can not be 0 if MaxSurge is 0.
                                       By default, a fixed value of 1 is used.
@@ -17651,6 +17701,16 @@ spec:
                                       can be scaled down further, followed by scaling up the new replicas, ensuring
                                       that at least 70% of original number of replicas are available at all times
                                       during the update.
+                                      During a combined template update and scale-up (or a scale-up during an active
+                                      rollout), the controller paces disruption against
+                                      max(0, min(baselineReplicas, spec.replicas) - maxUnavailable). Here
+                                      baselineReplicas is the non-surge replica count from before the rollout. For
+                                      this floor, a percentage maxUnavailable resolves against
+                                      min(baselineReplicas, spec.replicas). Pending additions do not consume the
+                                      disruption budget of existing groups, while Ready additions and surge groups
+                                      grant replacement credit. A superseding template update raises
+                                      baselineReplicas to the count of Ready groups (up to spec.replicas) to protect
+                                      Ready additions.
                                     x-kubernetes-int-or-string: true
                                   partition:
                                     default: 0

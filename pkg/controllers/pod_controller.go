@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -42,6 +43,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/lru"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -56,6 +58,7 @@ import (
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/computedomain"
 	"sigs.k8s.io/lws/pkg/features"
+	"sigs.k8s.io/lws/pkg/metrics"
 	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	acceleratorutils "sigs.k8s.io/lws/pkg/utils/accelerators"
 	controllerutils "sigs.k8s.io/lws/pkg/utils/controller"
@@ -70,6 +73,39 @@ type PodReconciler struct {
 	Scheme            *runtime.Scheme
 	Record            events.EventRecorder
 	SchedulerProvider schedulerprovider.SchedulerProvider
+	counted           countedLeaders
+	// workerUIDPolicy remembers whether a leader's revision records worker
+	// UIDs. The revision of a leader pod does not change, so this only skips
+	// a ControllerRevision lookup on routine worker updates before the record
+	// exists. It is not the record itself: that is an annotation on the leader.
+	workerUIDPolicy sync.Map
+}
+
+// countedLeaders remembers the leader pods each metric has counted. A
+// reconcile working from a lagging cache can act on a leader again, for
+// example delete a leader that is already terminating: the event repeats, the
+// count must not. Entries only need to outlive the cache lag. Each one follows
+// a write to the leader pod, so the client rate limit caps how fast they are
+// added: 4096 entries last at least 7s at the default QPS and burst of 500.
+type countedLeaders struct {
+	mu   sync.Mutex
+	seen *lru.Cache
+}
+
+// first reports whether metric has not counted the leader pod uid yet, and
+// records it.
+func (c *countedLeaders) first(metric string, uid types.UID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = lru.New(4096)
+	}
+	key := metric + "/" + string(uid)
+	if _, found := c.seen.Get(key); found {
+		return false
+	}
+	c.seen.Add(key, nil)
+	return true
 }
 
 // podReconcileRequest keeps the identity and snapshot of a deleted Pod in the
@@ -212,15 +248,15 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 		return ctrl.Result{}, nil
 	}
 	// Worker Pods need no reconciliation unless they triggered restart-policy
-	// handling or their group has a pending recreation. Avoid looking up a
-	// ControllerRevision on routine worker updates.
+	// handling, their group has a pending recreation, or the leader's worker
+	// UID record does not contain them. A worker whose UID is in the record
+	// returns here, without a ControllerRevision lookup.
 	if !podutils.LeaderPod(pod) && !podutils.ContainerRestarted(pod) && !podutils.PodDeleted(pod) {
-		leaderPodName := pod.Annotations[leaderworkerset.LeaderPodNameAnnotationKey]
-		if leaderPodName == "" {
-			leaderPodName, _ = statefulsetutils.GetParentNameAndOrdinal(pod.Name)
+		follow, err := r.workerFollowsRestartPolicy(ctx, &pod, &leaderWorkerSet)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-		var leader corev1.Pod
-		if leaderPodName == "" || r.Get(ctx, types.NamespacedName{Name: leaderPodName, Namespace: pod.Namespace}, &leader) != nil || leader.Annotations[leaderworkerset.GroupRecreatePendingAnnotationKey] == "" {
+		if !follow {
 			return ctrl.Result{}, nil
 		}
 	}
@@ -343,8 +379,13 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 		}
 	}
 
-	// Once size = 1, no need to create worker statefulSets.
-	if *groupLws.Spec.LeaderWorkerTemplate.Size == 1 {
+	// Once size = 1, no need to create worker statefulSets. Honor the leader's
+	// stamped size when its ControllerRevision has not been observed yet.
+	groupSize := int(*groupLws.Spec.LeaderWorkerTemplate.Size)
+	if revision == nil {
+		groupSize = podGroupSize(&pod, *groupLws.Spec.LeaderWorkerTemplate.Size)
+	}
+	if groupSize == 1 {
 		return backoffResult, nil
 	}
 
@@ -391,7 +432,10 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 	statefulSet.Spec.Template.WithAnnotations(templateAnnotations)
 
 	// if exclusive placement is enabled but leader pod is not scheduled, don't create the worker sts
-	if topologyKey, found := leaderWorkerSet.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]; found {
+	// The key comes from the leader pod, not the LeaderWorkerSet: a group on an
+	// old revision keeps the placement it started with while a rollout moves the
+	// value between the annotation and the placementPolicy field.
+	if topologyKey := pod.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]; topologyKey != "" {
 		// check if the leader pod is scheduled.
 		if pod.Spec.NodeName == "" {
 			log.V(2).Info(fmt.Sprintf("Pod %q is not scheduled yet", pod.Name))
@@ -438,7 +482,7 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 				r.Record.Eventf(&leaderWorkerSet, &pod, corev1.EventTypeWarning, FailedCreate, Create, fmt.Sprintf("Failed to create worker statefulset for leader pod %s: %v", pod.Name, err))
 				return ctrl.Result{}, err
 			}
-			return backoffResult, nil
+			return r.finishLeaderReconcile(ctx, &pod, groupLws, backoffResult)
 		}
 		r.Record.Eventf(&leaderWorkerSet, &pod, corev1.EventTypeNormal, GroupsProgressing, Create, fmt.Sprintf("Created worker statefulset for leader pod %s", pod.Name))
 	} else {
@@ -457,7 +501,7 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 		}
 	}
 	log.V(2).Info("Worker Reconcile completed.")
-	return backoffResult, nil
+	return r.finishLeaderReconcile(ctx, &pod, groupLws, backoffResult)
 }
 
 // recreateGroupSplitByUpgrade recreates the group of leader if an LWS upgrade
@@ -507,6 +551,9 @@ func (r *PodReconciler) recreateGroupSplitByUpgrade(ctx context.Context, lws *le
 	r.Record.Eventf(lws, leader, corev1.EventTypeNormal, "RecreateGroup", Delete,
 		"Worker statefulset %s was created by a previous LWS version and its workers do not join the PodGroups of leader pod %s, deleted the leader pod to recreate group %s",
 		workerSts.Name, leader.Name, leader.Labels[leaderworkerset.GroupIndexLabelKey])
+	if r.counted.first("recreation", leader.UID) {
+		metrics.GroupRecreated(lws.Namespace, lws.Name, metrics.GroupRecreateReasonUpgradeSplit)
+	}
 	return true, nil
 }
 
@@ -579,12 +626,38 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 
 	isRecreatePending := leader.Annotations[leaderworkerset.GroupRecreatePendingAnnotationKey] != ""
 
+	// A worker deleted or replaced while this process was down leaves no
+	// deletion timestamp and no container restart. The leader's worker UID
+	// record is what makes that visible. A pod that already carries a failure
+	// signal keeps its own identity so the event names that pod.
+	signaled := isRecreatePending || podutils.ContainerRestarted(pod) || podutils.PodDeleted(pod)
+	identityLost := false
+	if !signaled {
+		lostPod, missingUID, lost, err := r.workerIdentityLost(ctx, &leader)
+		if err != nil {
+			return false, ctrl.Result{}, err
+		}
+		if lost {
+			identityLost = true
+			if lostPod != nil {
+				pod = *lostPod.DeepCopy()
+			} else {
+				pod = missingWorkerPod(&leader, missingUID)
+			}
+			if pod.DeletionTimestamp == nil {
+				now := metav1.Now()
+				pod.DeletionTimestamp = &now
+			}
+			log.V(2).Info("Worker UID record does not match the group", "leader", leader.Name, "worker", pod.Name)
+		}
+	}
+
 	// the leader pod will be deleted if the worker pod is deleted or any container was restarted
 	if !isRecreatePending && !podutils.ContainerRestarted(pod) && !podutils.PodDeleted(pod) {
 		return false, ctrl.Result{}, nil
 	}
 
-	if !podutils.LeaderPod(pod) {
+	if !podutils.LeaderPod(pod) && !identityLost {
 		// Different revision key means that this pod will be deleted soon and alternative will be created with the matching key
 		if revisionutils.GetRevisionKey(&leader) != revisionutils.GetRevisionKey(&pod) {
 			return false, ctrl.Result{}, nil
@@ -643,10 +716,7 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 	recreateAfterStart := policy == leaderworkerset.RecreateGroupAfterStart || hasRecreateGroupAfterStartAnnotation
 	if recreateAfterStart && !isRecreatePending && !alreadyCharged {
 		// Old groups keep their original size during a rollout that changes it.
-		groupSize := int(*leaderWorkerSet.Spec.LeaderWorkerTemplate.Size)
-		if size, err := strconv.Atoi(pod.Annotations[leaderworkerset.SizeAnnotationKey]); err == nil {
-			groupSize = size
-		}
+		groupSize := podGroupSize(&pod, int32(podGroupSize(&leader, *leaderWorkerSet.Spec.LeaderWorkerTemplate.Size)))
 		startState, unschedulablePod, err := r.groupStartState(ctx, leader, pod, groupSize)
 		if err != nil {
 			return false, ctrl.Result{}, err
@@ -702,6 +772,9 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 						r.Record.Eventf(&leaderWorkerSet, &leader, corev1.EventTypeNormal, GroupRestartBackoff, Update,
 							fmt.Sprintf("Backing off recreation of group %s for %v (restart count %d)",
 								leader.Labels[leaderworkerset.GroupIndexLabelKey], requeueAfter, count))
+						if r.counted.first("backoff", leader.UID) {
+							metrics.GroupRestartBackedOff(leaderWorkerSet.Namespace, leaderWorkerSet.Name)
+						}
 					}
 					return false, ctrl.Result{RequeueAfter: requeueAfter}, nil
 				}
@@ -724,6 +797,9 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 		return true, ctrl.Result{}, nil
 	}
 	r.Record.Eventf(&leaderWorkerSet, &leader, corev1.EventTypeNormal, "RecreateGroup", Delete, fmt.Sprintf("Worker pod %s failed, deleted leader pod %s to recreate group %s", pod.Name, leader.Name, leader.Labels[leaderworkerset.GroupIndexLabelKey]))
+	if r.counted.first("recreation", leader.UID) {
+		metrics.GroupRecreated(leaderWorkerSet.Namespace, leaderWorkerSet.Name, metrics.GroupRecreateReasonPodRestart)
+	}
 	return true, ctrl.Result{}, nil
 }
 
@@ -864,6 +940,9 @@ func (r *PodReconciler) terminateExhaustedGroup(ctx context.Context, lws *leader
 	}
 	r.Record.Eventf(lws, leader, corev1.EventTypeWarning, "ReplicaRestartBudgetExceeded", Delete,
 		fmt.Sprintf("Restart budget exhausted; terminated group %s and stopped automatic recovery", leader.Labels[leaderworkerset.GroupIndexLabelKey]))
+	if r.counted.first("exhausted", leader.UID) {
+		metrics.GroupRestartBudgetExhausted(lws.Namespace, lws.Name)
+	}
 	return true, nil
 }
 
@@ -1701,16 +1780,16 @@ func constructWorkerStatefulSetApplyConfiguration(leaderPod corev1.Pod, lws lead
 	// pod template with live size/subGroupPolicy/networkConfig breaks the group.
 	podAnnotations[leaderworkerset.SizeAnnotationKey] = strconv.Itoa(int(*currentLws.Spec.LeaderWorkerTemplate.Size))
 	podAnnotations[leaderworkerset.LeaderPodNameAnnotationKey] = leaderPod.Name
-	if lws.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey] != "" {
-		podAnnotations[leaderworkerset.ExclusiveKeyAnnotationKey] = lws.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]
+	// Exclusive placement keys are copied from the leader pod so workers of an
+	// old-revision group keep the placement their leader was created with.
+	if topologyKey := leaderPod.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]; topologyKey != "" {
+		podAnnotations[leaderworkerset.ExclusiveKeyAnnotationKey] = topologyKey
 	}
 	if currentLws.Spec.LeaderWorkerTemplate.SubGroupPolicy != nil {
-		if currentLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type != nil {
-			podAnnotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey] = string(*currentLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type)
-		}
+		podAnnotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey] = string(ptr.Deref(currentLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type, leaderworkerset.SubGroupPolicyTypeLeaderWorker))
 		podAnnotations[leaderworkerset.SubGroupSizeAnnotationKey] = strconv.Itoa(int(*currentLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize))
-		if lws.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] != "" {
-			podAnnotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] = lws.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]
+		if topologyKey := leaderPod.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]; topologyKey != "" {
+			podAnnotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] = topologyKey
 		}
 	}
 	acceleratorutils.AddTPUAnnotations(leaderPod, podAnnotations)
